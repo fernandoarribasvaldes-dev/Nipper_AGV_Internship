@@ -4,16 +4,55 @@
 
 function main_simulation
 
-% Initial conditions
-% Initial postion = [x y theta]
-initial_position = [0 0 0];
+    clc; close all;
 
-pid.kp = 10;
-pid.kd = 0;
-pid.ki = 0;
+    %% 1. Initialize System Components
+    kinematics = AGV_kinematics();
+    cmd = velocity_generator();
+    
+    % Simulation timing parameters
+    dt = 0.01; 
+    t0 = 0;
+    t_final = cmd.time(end);
+    time = 0:dt:t_final;
+    N = length(time);
 
-% Simulation
-%[t, x] ode45(@(t,x) AGV_kinematics(), [0,60], initial_position); 
+    % Initial robot state: [x, y, theta]
+    q = [0; 0; 0]; 
+    XI = zeros(3, N); % Log state history
+    
+    % Controller setup: Create 4 independent PID structs (1 per turret)
+    PID_gains = [10, 0.1, 0.5, 2.0]; % [Kp, Ki, Kd, i_limit]
+    turret_PIDs = repmat(struct('integral', 0, 'e_phi_previous', 0), 1, 4);
+
+    %% 2. Main Simulation Loop
+    for k = 1:N
+        t_curr = time(k);
+        
+        % Interpolate trajectory velocity commands [Vx; Vy; W]
+        Vx = interp1(cmd.time, cmd.vx, t_curr);
+        Vy = interp1(cmd.time, cmd.vy, t_curr);
+        W  = interp1(cmd.time, cmd.w,  t_curr);
+        
+        % Run Control Loop to calculate steering rate and wheel velocities
+        [phi_dot_cmd, omega_wheels, turret_PIDs, kinematics] = ...
+            control_loop(Vx, Vy, W, kinematics, turret_PIDs, PID_gains, dt);
+        
+        % Update AGV Global Kinematics (Numerical Integration)
+        theta = q(3);
+        R = [cos(theta), -sin(theta), 0;
+             sin(theta),  cos(theta), 0;
+             0,           0,          1];
+         
+        q_dot = R * [Vx; Vy; W];
+        q = q + q_dot * dt;
+        
+        % Log state
+        XI(:, k) = q;
+    end
+
+    %% 3. Plotting & Animation
+    run_animation(time, XI, dt); 
 
 
 end
@@ -21,7 +60,7 @@ end
 
 %% Kinematics of the system
 
-function AGV_kinematics
+function kinematics_AGV = AGV_kinematics 
 
     distance_x = 0.657; % m
     distance_y = 0.18625; % m
@@ -33,14 +72,14 @@ function AGV_kinematics
         distance_x, distance_y];
 
     kinematics_AGV.wheel_array = [
-        1, 0, turrets_position(1,2);
-        0, 1, turrets_position(1,1);
-        1, 0, turrets_position(2,1);
-        0, 1, turrets_position(2,2);
-        1, 0, turrets_position(3,1);
-        0, 1, turrets_position(3,2);
-        1, 0, turrets_position(4,1);
-        0, 1, turrets_position(4,2)];
+        1, 0, -kinematics_AGV.turrets_position(1,2);
+        0, 1, kinematics_AGV.turrets_position(1,1);
+        1, 0, -kinematics_AGV.turrets_position(2,1);
+        0, 1, kinematics_AGV.turrets_position(2,2);
+        1, 0, -kinematics_AGV.turrets_position(3,1);
+        0, 1, kinematics_AGV.turrets_position(3,2);
+        1, 0, -kinematics_AGV.turrets_position(4,1);
+        0, 1, kinematics_AGV.turrets_position(4,2)];
 
     kinematics_AGV.radius_wheel = 0.07; % m
     kinematics_AGV.distance_between_wheels = 0.15; % m
@@ -51,46 +90,88 @@ end
 
 %% Controller for the AGV
 
-function PID
+function [phi_dot, PID] = PID_controller (PID, Gains, e_phi, dt)
+
+    Kp = Gains(1);
+    Ki = Gains(2);
+    Kd = Gains(3);
+    i_limit = Gains(4);
+
+    % Integral
+    PID.integral = PID.integral + e_phi*dt;
+    PID.integral = max(min(PID.integral, i_limit), -i_limit);
+
+    % Derivative
+    derivative = (e_phi - PID.e_phi_previous)/dt;
+
+    % PID
+    phi_dot = Kp*e_phi ...
+        + Ki*PID.integral ...
+        + Kd*derivative;
+
+    % Store error for next iteration
+    PID.e_phi_previous = e_phi;
+    
 
 
 end
 
 %% Control loop
 
-function control_loop (Vx, Vy, W, kinematics)
+function [phi_dot_cmd, omega_wheels, turret_PIDs, kinematics] = ...
+    control_loop(Vx, Vy, W, kinematics, turret_PIDs, Gains, dt)
 
-    velocity = [Vx, Vy, W];
+    velocity = [Vx; Vy; W];
 
-    turrets_velocities = dot(kinematics.turrets_postions, velocity);
+    turrets_velocities = reshape(kinematics.wheel_array * velocity, 2,4)';
 
-    wheel_commands = [];
+    phi_dot_cmd = zeros(4, 1);
+    omega_wheels = zeros(4, 2);
+    dt = 0.01;
 
-    [rows, columns] = size(turrets_velocities);
-
-    for i = 1:size(turret_velocities, 1)
+    for i = 1:4
 
         % Extract velocities 
         vx_i = turrets_velocities(i, 1);
         vy_i = turrets_velocities(i, 2);
 
-        v_bar = sqrt(vx_i^2, vy_i^2);
+        v_bar = sqrt(vx_i^2 + vy_i^2);
         raw_phi = atan2(vy_i, vx_i);
 
 
         % Angle protection
-        if abs(wrapToPi(raw_phi) > pi/2)
-            phi_des = wrapToPi(raw_phi + pi);
+        if abs(wrapToPi(raw_phi)) > pi/2
+            phi_desired = wrapToPi(raw_phi + pi);
             v_bar = -v_bar;
             
         else
-            phi_des = raw_phi;
+            phi_desired = raw_phi;
 
         end
 
         % Actual data of the robot
-        phi_act = kinematics.turret_angles(i);
-        e_phi = wrapToPi
+        phi_actual = kinematics.turret_angles(i);
+        error_phi = wrapToPi(phi_desired - phi_actual);
+
+
+        % Heading PID controllers definition
+        [phi_dot, turret_PIDs(i)] = PID_controller(turret_PIDs(i), Gains, error_phi, dt);
+        phi_dot_cmd(i) = phi_dot;
+
+        % Update steering turret angles
+        kinematics.turret_angles(i) = wrapToPi(phi_actual + phi_dot*dt);
+
+
+        % Differential robot wheel conversion
+        v_left = v_bar - 0.5 * kinematics.distance_between_wheels * phi_dot;
+        v_right = v_bar + 0.5 * kinematics.distance_between_wheels * phi_dot;
+
+        omega_left = v_left/kinematics.radius_wheel;
+        omega_right = v_right/kinematics.radius_wheel;
+
+        kinematics.wheel_commands(i,:) = [omega_left, omega_right];
+
+        % Wheel control
 
     end
 
@@ -101,7 +182,7 @@ end
 
 %% Warehouse enviroment
 
-function warehouse_function
+function warehouse = warehouse_function()
 
     warehouse.width = 30; % m
     warehouse.length = 50; % m
@@ -118,12 +199,56 @@ function warehouse_function
 
 end
 
-function velocity_generator
+function command = velocity_generator()
 
     command.time = [0 5 10 15 20 25 30 35 40 45 50 55 60];
 
-    command.vx = [1 0 -1 0 1 -1 0 1 -1 0 0];
-    command.vy = [0 1 0 -1 1 -1 0 0 0 1 -1];
-    command.w  = [0 0 0 0 0 0 1 -1 1 -1 1 -1];
+    command.vx = [1 0 -1 0 1 -1 0 1 -1 0 0 0 0];
+    command.vy = [0 1 0 -1 1 -1 0 0 0 1 -1 0 0];
+    command.w  = [0 0 0 0 0 0 1 -1 1 -1 1 0 0];
 
+end
+
+%% --- AGV Animation Plotting ---
+function run_animation(t, XI, dt)
+    figure('Name', 'AGV Simulation', 'NumberTitle', 'off');
+    
+    % Subplot 1: Trajectory
+    subplot(2, 1, 1);
+    plot(t, XI', 'LineWidth', 1.5);
+    xlabel('Time (s)'); ylabel('State Vector');
+    legend('x (m)', 'y (m)', '\theta (rad)', 'Location', 'best');
+    grid on; title('State vs Time');
+
+    % Subplot 2: 2D Motion Animation
+    subplot(2, 1, 2);
+    grid on; hold on; axis equal;
+    title('AGV Motion Trajectory');
+    xlabel('X Position (m)'); ylabel('Y Position (m)');
+    
+    trajplot = plot(XI(1,1), XI(2,1), '--k', 'LineWidth', 1);
+    
+    % Draw initial AGV body triangle
+    BV = [-0.3, 0, 0.3; -0.2, 0.4, -0.2];
+    q0 = XI(:, 1);
+    R0 = [cos(q0(3)-pi/2), -sin(q0(3)-pi/2); sin(q0(3)-pi/2), cos(q0(3)-pi/2)];
+    IV = R0 * BV;
+    bodyplot = fill(IV(1,:) + q0(1), IV(2,:) + q0(2), [0.3, 0.7, 0.9]);
+
+    % Downsampled animation loop for performance
+    step_stride = max(1, round(0.05 / dt));
+    for n = 1:step_stride:length(t)
+        q = XI(:, n);
+        x = q(1); y = q(2); theta = q(3);
+        
+        trajplot.XData = XI(1, 1:n);
+        trajplot.YData = XI(2, 1:n);
+        
+        R = [cos(theta-pi/2), -sin(theta-pi/2); sin(theta-pi/2), cos(theta-pi/2)];
+        IV = R * BV;
+        bodyplot.XData = IV(1,:) + x;
+        bodyplot.YData = IV(2,:) + y;
+        
+        drawnow limitrate;
+    end
 end
